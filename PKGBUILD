@@ -1,5 +1,5 @@
-pkgname=mkinitcpio-git
-pkgver=$(make version)
+pkgname=mkinitcpio
+pkgver=38.bredos
 pkgrel=1
 pkgdesc="Modular initramfs image creation utility"
 arch=(any)
