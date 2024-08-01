@@ -3,6 +3,7 @@ vim:set ts=4 sw=4 syntax=asciidoc noet:
 SPDX-License-Identifier: GPL-2.0-only
 ////
 :doctype: manpage
+:manmanual: mkinitcpio manual
 
 = mkinitcpio(8)
 
@@ -70,6 +71,9 @@ other features.
 
 *-n*, *--nocolor*::
     Disable color output.
+    
+*--nopost*::
+    Do not run post hooks. 
 
 *-U*, *--uki* _filename_::
     Generate a unified kernel image as _filename_. If a CPIO image is
@@ -126,7 +130,7 @@ other features.
 
 *--cmdline* _filename_::
     Use kernel command line with unified kernel image. If none is specified,
-    try one of the files _/etc/kernel/cmdline_, _/usr/share/kernel/cmdline_
+    try one of the files _/etc/kernel/cmdline_, _/usr/lib/kernel/cmdline_
     or _/proc/cmdline_.
 
 *--no-cmdline*::
@@ -139,14 +143,25 @@ other features.
     UEFI executables can show a bitmap file on boot.
 
 *--uefistub* _filename_::
-    UEFI stub image used for unified kernel image generation.
+    UEFI stub image used for unified kernel image generation. Has no effect
+    if _ukify_ is being used.
     Default: Attempts to look for a systemd-boot or gummiboot
     stub loader.
 
+*--ukiconfig* _filename_::
+    Configuration file to pass to _ukify_. If none is specified, try one of the
+    files  _/etc/kernel/uki.conf_ or _/usr/lib/kernel/uki.conf_. If neither of
+    those exists, _ukify_ will use its internal default.
+
+*--no-ukify*::
+    Do not use _ukify_ to build UKIs even if it is available. This is not
+    recommended.
+
 *--kernelimage* _filename_::
     Include a kernel image for the unified kernel image. Default: one of
-    _/lib/modules/${KERNELVERSION}/vmlinuz_, _/boot/vmlinuz-${KERNELVERSION}_,
-    or _/boot/vmlinuz-linux_.
+    _/lib/modules/${KERNELVERSION}/vmlinuz_, _/lib/modules/${KERNELVERSION}/vmlinux_,
+    _/boot/vmlinuz-${KERNELVERSION}_, _/boot/vmlinux-${KERNELVERSION}_,
+    _/boot/vmlinuz-linux_, or _/boot/vmlinux-linux_.
 
 *--osrelease* _filename_::
     Include a os-release file for the unified kernel image.
@@ -223,8 +238,16 @@ functions exist to facilitate this.
     specified. By default, the destination and mode will be taken from the
     source and mode of the file specified by the _path_.
 
+*add_file_early* _path_ [ _destination_ ] [ _mode_ ]::
+    Adds a file and any needed parent directories to the early uncompressed
+    image. Works the same way as *add_file*.
+
 *add_dir* _path_::
     Adds a directory and its parents to the image.
+
+*add_dir_early* _path_::
+    Adds a directory and its parents to the early uncompressed image. Works the
+    same way as *add_dir*.
 
 *add_full_dir* _directory_ [ _glob_ ] [ _strip_prefix_ ]::
     Recursively adds a directory to the image by walking the given path and
@@ -322,18 +345,26 @@ run in reverse.
     of boot failure. For example this allows boot splash screens to terminate
     their process, so users will notice the failure.
 
+*getarg* _argument_ [ _default_ ]::
+    This function can be used in runtime hooks to get an argument from the
+    kernel cmdline. If _argument_ exists with a value, the value is returned. If
+    _argument_ exists without a value, _y_ is returned. If _argument_ does not
+    exist, _default_ is returned. If _default_ is not specified, nothing is
+    returned.
+
 == About post hooks
 
-Post hooks are executables or scripts that get executed after the image has been
-successfully generated and can be used for further processing (i.e. signing).
+Post hooks are executables or scripts executed after successful image generation for 
+further processing, like signing. When *kernel-install*(8) invokes mkinitcpio, post 
+hooks are disabled.
+
 They receive the kernel as the first argument, the image as second and
 optionally the unified kernel image as a third.
 
-Note that the first argument will be empty when the mkinitcpio has been invoked
-with *-k* _none_ or *-k* _version_ and the kernel image cannot be found on the
-file system.
+Note: If mkinitcpio is invoked with *-k* _none_ or *-k* _version_ and the kernel image 
+is not found, the first argument will be empty.
 
-The following enviroment variables are passed:
+The following environment variables are passed:
 
 *KERNELVERSION*::
     Contains the full version of the kernel the image has been built from.

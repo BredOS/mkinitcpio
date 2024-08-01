@@ -4,7 +4,7 @@
 # lsinitcpio - dump the contents of an initramfs image
 #
 
-shopt -s extglob globstar
+shopt -s extglob
 
 _list='--list'
 _optcolor=1
@@ -51,6 +51,20 @@ decomp() {
     else
         ${_compress:-cat} ${_compress:+-cd} "$image"
     fi
+}
+
+unpack_uki() {
+    local image="$1" workdir="$2"
+
+    command -v objcopy &>/dev/null || die "Unable to unpack UKI: missing 'objcopy'"
+
+    objcopy \
+        --dump-section .initrd="$workdir"/initcpio.img \
+        --dump-section .cmdline="$workdir"/cmdline.txt \
+        --dump-section .osrel="$workdir"/os-release.txt \
+        --dump-section .uname="$workdir"/uname.txt \
+        "$image" /dev/null 2>/dev/null
+    printf '%s/initcpio.img' "$workdir"
 }
 
 # shellcheck source=functions
@@ -112,8 +126,19 @@ detect_filetype() {
     die "Unexpected file type. Are you sure '%s' is an initramfs?" "$file"
 }
 
+detect_uki() {
+    local file="$1" bytes
+
+    IFS='' read -r -n 2 -d '' bytes < "$file"
+
+    if [[ "$bytes" = "MZ" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 detect_early_img() {
-    local early=0
+    local -i early=0
     # early cpio archives can have a file called early_cpio in them
     early="$(LC_ALL=C.UTF-8 bsdtar -xOf "$1" early_cpio 2>/dev/null)"
     if [[ -z "$early" ]]; then
@@ -156,12 +181,9 @@ skip_early_img() {
 }
 
 analyze_image() {
-    local -a binaries explicitmod modules foundhooks hooks imagename
-    local kernver ratio columns image="$1" offset="$2"
+    local -a binaries explicitmod modules imagename
+    local kernver ratio columns image="$1" optimage="$2" offset="$3" workdir="$4"
     columns="$(tput cols)"
-
-    workdir="$(mktemp -d --tmpdir lsinitcpio.XXXXXX)"
-    trap 'rm -rf "$workdir"' EXIT
 
     # fallback in case tput failed us
     columns="${columns:-80}"
@@ -180,39 +202,46 @@ analyze_image() {
     fi
 
     # decompress the image since we need to read from it multiple times.
-    decomp "$image" "$offset" | bsdtar -C "$workdir" -xf - || die 'Failed to decompress image'
-
-    modules=("$workdir/usr/lib/modules"/*/kernel/**/*.ko*)
-    if [[ -f "${modules[0]}" ]]; then
-        IFS=/ read -r _ _ _ kernver _ <<<"${modules[0]#$workdir/}"
-        modules=("${modules[@]##*/}")
-        modules=("${modules[@]%.ko*}")
-    else
-        unset modules
+    install -dm755 "$workdir/initcpio"
+    if (( offset > 0 )); then
+        bsdtar -C "$workdir/initcpio" -xf "$image" || die 'Failed to decompress early cpio'
     fi
+    decomp "$image" "$offset" | bsdtar -C "$workdir/initcpio" -xf - || die 'Failed to decompress image'
 
-    foundhooks=("$workdir"/hooks/*)
-    if [[ -f "${foundhooks[0]}" ]]; then
-        foundhooks=("${foundhooks[@]##*/}")
-    else
-        unset foundhooks
-    fi
 
-    mapfile -t binaries < <(LC_ALL=C.UTF-8 find "$workdir/usr/bin" -type f -printf %f\\n)
+    shopt -s globstar nullglob
+    modules=("$workdir/initcpio/usr/lib/modules"/*/{kernel/**,extramodules}/*.ko*)
+    IFS=/ read -r _ _ _ kernver _ <<<"${modules[0]#$workdir/initcpio/}"
+    shopt -u globstar nullglob
 
-    read -r version <"$workdir/VERSION"
+    mapfile -t binaries < <(LC_ALL=C.UTF-8 find "$workdir/initcpio/usr/bin" -type f -printf %f\\n)
+
+    read -r version <"$workdir/initcpio/VERSION"
 
     # shellcheck disable=SC1090,SC1091
-    . "$workdir/config"
+    . "$workdir/initcpio/config"
 
-    explicitmod=("${MODULES[@]}")
+    # MODULES in /config is a string
+    # shellcheck disable=SC2128
+    read -ra explicitmod <<<"$MODULES"
 
     # print results
-    imagename=("$image")
-    [[ -L "$image" ]] && imagename+=(" -> $(readlink -e "$image")")
+    imagename=("$optimage")
+    [[ -L "$optimage" ]] && imagename+=(" -> $(readlink -e "$optimage")")
     msg 'Image: %s%s' "${imagename[@]}"
     [[ -n "$version" ]] && msg 'Created with mkinitcpio %s' "$version"
     msg 'Kernel: %s' "${kernver:-unknown}"
+    [[ -f "$workdir"/uname.txt ]] && msg 'uname: %s' "$(tr -d '\0' < "$workdir"/uname.txt)"
+    if [[ -f "$workdir"/os-release.txt ]]; then
+        (
+            unset -v PRETTY_NAME NAME ID VERSION_ID BUILD_ID
+            # shellcheck disable=SC1091
+            . "$workdir"/os-release.txt
+            msg 'OS Release: %s (%s %s)' "${PRETTY_NAME:-${NAME:-linux}}" \
+                "${ID:-linux}" "${VERSION_ID:-${BUILD_ID:-rolling}}"
+        )
+    fi
+    [[ -f "$workdir"/cmdline.txt ]] && msg 'Command line: %s' "$(tr -d '\0' < "$workdir"/cmdline.txt)"
     if (( offset > 0 )); then
         # the zero-indexed offset of the main image is the same as the size of the early image
         msg 'Early CPIO: %s' "$(size_to_human "$offset")"
@@ -228,8 +257,10 @@ analyze_image() {
     fi
     printf '\n'
 
-    if (( ${#modules[*]} )); then
-        msg 'Included modules:'
+    if (( ${#modules[@]} )); then
+        modules=("${modules[@]##*/}")
+        modules=("${modules[@]%.ko*}")
+        msg 'Included modules (%d):' "${#modules[@]}"
         for mod in "${modules[@]}"; do
             printf '  %s' "$mod"
             in_array "${mod//_/-}" "${explicitmod[@]//_/-}" && printf ' [explicit]'
@@ -238,7 +269,7 @@ analyze_image() {
         printf '\n'
     fi
 
-    msg 'Included binaries:'
+    msg 'Included binaries (%d):' "${#binaries[@]}"
     printf '  %s\n' "${binaries[@]}" | LC_ALL=C.UTF-8 sort | column -c"${columns}"
     printf '\n'
 
@@ -323,7 +354,8 @@ while :; do
     shift
 done
 
-_image="$1"
+_optimage="$1"
+_image="$_optimage"
 
 if [[ -t 1 ]] && (( _optcolor )); then
     try_enable_color
@@ -353,6 +385,14 @@ case $(( _optearly + _optcpio )) in
     # if >1, same as 0
 esac
 
+_workdir="$(mktemp -d --tmpdir lsinitcpio.XXXXXX)"
+trap 'rm -rf "$_workdir"' EXIT
+
+if detect_uki "$_image"; then
+    _image="$(unpack_uki "$_image" "$_workdir")" || die "Failed to unpack file as UKI: '%s'" "$_optimage"
+    [[ -f "$_image" ]] || die "File does not contain initcpio image: '%s'" "$_optimage"
+fi
+
 if (( $(detect_early_img "$_image") )); then
     _offset="$(skip_early_img "$_image")"
 else
@@ -364,7 +404,7 @@ fi
 _compress="$(detect_filetype "$_image" "$_offset")" || exit
 
 if (( _optanalyze )); then
-    analyze_image "$_image" "$_offset"
+    analyze_image "$_image" "$_optimage" "$_offset" "$_workdir"
 elif (( _optshowconfig )); then
     decomp "$_image" "$_offset" | bsdtar xOf - buildconfig 2>/dev/null ||
         die 'Failed to extract config from image (mkinitcpio too old?)'

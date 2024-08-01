@@ -1,20 +1,21 @@
 #!/usr/bin/ash
 
 run_hook() {
+    local quiet rootdelay
     modprobe -a -q dm-crypt >/dev/null 2>&1
-    # assigned by parse_cmdline
-    # shellcheck disable=SC2154
+    quiet="$(getarg quiet)"
     [ "${quiet}" = "y" ] && CSQUIET=">/dev/null"
 
     # Get keyfile if specified
     ckeyfile="/crypto_keyfile.bin"
     if [ -n "$cryptkey" ]; then
-        IFS=: read -r ckdev ckarg1 ckarg2 <<EOF
+        # cryptkey can contain : which needs to be escaped.
+        # shellcheck disable=SC2162
+        IFS=: read ckdev ckarg1 ckarg2 <<EOF
 $cryptkey
 EOF
 
-        # rootdelay is assigned by parse_cmdline
-        # shellcheck disable=SC2154
+        rootdelay="$(getarg rootdelay)"
         if [ "$ckdev" = "rootfs" ]; then
             ckeyfile=$ckarg1
         elif resolved=$(resolve_device "${ckdev}" "${rootdelay}"); then
@@ -39,7 +40,9 @@ EOF
 
     if [ -n "${cryptdevice}" ]; then
         DEPRECATED_CRYPT=0
-        IFS=: read -r cryptdev cryptname cryptoptions <<EOF
+        # cryptdevice can contain : which needs to be escaped.
+        # shellcheck disable=SC2162
+        IFS=: read cryptdev cryptname cryptoptions <<EOF
 $cryptdevice
 EOF
     else
@@ -129,7 +132,9 @@ EOF
                 return 1
             fi
             exe="cryptsetup open --type plain $resolved $cryptname $cryptargs"
-            IFS=: read -r c_hash c_cipher c_keysize c_offset c_skip <<EOF
+            # c_cipher can contain : which needs to be escaped.
+            # shellcheck disable=SC2162
+            IFS=: read c_hash c_cipher c_keysize c_offset c_skip <<EOF
 $crypto
 EOF
             [ -n "$c_hash" ]    && exe="$exe --hash '$c_hash'"
@@ -157,7 +162,7 @@ EOF
                 return 1
             fi
         else
-            err "Failed to open encryption mapping: The device ${cryptdev} is not a LUKS volume and the crypto= paramater was not specified."
+            err "Failed to open encryption mapping: The device ${cryptdev} is not a LUKS volume and the crypto= parameter was not specified."
         fi
     fi
     rm -f "${ckeyfile}"

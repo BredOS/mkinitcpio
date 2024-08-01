@@ -26,9 +26,9 @@ _d_presets=mkinitcpio.d
 # options and runtime data
 _optmoduleroot='' _optgenimg=''
 _optcompress='' _opttargetdir=''
-_optosrelease=''
+_optosrelease='' _optukiconfig=''
 _optuki='' _optcmdline='' _optsplash='' _optkernelimage='' _optuefistub=''
-_optshowautomods=0 _optsavetree=0 _optshowmods=0 _optremove=0 _optnocmdline=0
+_optshowautomods=0 _optsavetree=0 _optshowmods=0 _optremove=0 _optnocmdline=0 _optnoukify=0 _optnopost=0
 _optquiet=1 _optcolor=1 _optconfd=1
 _optskiphooks=() _optaddhooks=() _hooks=() _optpreset=() _tmpfiles=() _generated=()
 declare -A _runhooks _addedmodules _modpaths _autodetect_cache
@@ -57,6 +57,7 @@ usage: ${0##*/} [options]
    -L, --listhooks              List all available hooks
    -M, --automods               Display modules found via autodetection
    -n, --nocolor                Disable colorized output messages
+       --nopost                 Disable post hooks 
    -p, --preset <file>          Build specified preset from /etc/mkinitcpio.d
    -P, --allpresets             Process all preset files in /etc/mkinitcpio.d
    -R, --remove                 Remove specified preset images
@@ -75,10 +76,12 @@ usage: ${0##*/} [options]
   Options for unified kernel image (-U, --uki):
    --cmdline <path>             Set kernel command line from file
                                 (default: /etc/kernel/cmdline or /proc/cmdline)
+   --no-cmdline                 Do not embed a kernel command line
    --osrelease <path>           Include os-release (default: /etc/os-release)
    --splash <path>              Include bitmap splash
    --kernelimage <path>         Kernel image
    --uefistub <path>            Location of UEFI stub loader
+   --ukiconfig <path>           Location of configuration file for UKIs, used for signing, etc.
 
 EOF
 }
@@ -231,7 +234,7 @@ compute_hookset() {
 
 create_image() {
     # create_image <root> <output file> <compression type>
-    local root="$1" out="$2" compress="$3" compress_cmd="$3" pipestatus
+    local root="$1" out="$2" compress="$3" compress_cmd="$3" pipestatus pipeprogs
 
     if [[ "$compress" == 'early' ]]; then
         # early image should never be compressed
@@ -249,7 +252,7 @@ create_image() {
         | LC_ALL=C.UTF-8 sort -z \
         | LC_ALL=C.UTF-8 bsdtar --uid 0 --gid 0 --null -cnf - -T - \
         | LC_ALL=C.UTF-8 bsdtar --null -cf - --format=newc @- \
-        | "$compress_cmd" "${COMPRESSION_OPTIONS[@]}" >>"$compressout"
+        | "$compress_cmd" "${COMPRESSION_OPTIONS[@]}" >>"$out"
 
     pipestatus=("${PIPESTATUS[@]}")
     pipeprogs=('find' 'sort' 'bsdtar (step 1)' 'bsdtar (step 2)' "$compress_cmd")
@@ -264,8 +267,56 @@ create_image() {
     done
 }
 
+# Decompress firmware files
+decompress_firmware() {
+    local buildroot_fwpath=() fw_files=() fw_file_symlinks=() file linkobject symlink_message
+
+    buildroot_fwpath=("${_d_fwpath[@]/#/$BUILDROOT}")
+
+    mapfile -d '' -t fw_files < <(LC_ALL=C.UTF-8 find "${buildroot_fwpath[@]:?}" -type f -name '*.zst' -print0 2>/dev/null | LC_ALL=C.UTF-8 sort -uz)
+    if (( ${#fw_files[@]} )); then
+        msg 'Decompressing zstd-compressed firmware files'
+        for file in "${fw_files[@]}"; do
+            quiet "Decompressing '%s'" "${file#"$BUILDROOT"}"
+            zstd -qd --rm -- "$file"
+        done
+        mapfile -d '' -O "${#fw_file_symlinks[@]}" -t fw_file_symlinks \
+            < <(LC_ALL=C.UTF-8 find "${buildroot_fwpath[@]:?}" -type l -name '*.zst' -print0 2>/dev/null | LC_ALL=C.UTF-8 sort -uz)
+    fi
+    mapfile -d '' -t fw_files < <(LC_ALL=C.UTF-8 find "${buildroot_fwpath[@]:?}" -type f -name '*.xz' -print0 2>/dev/null | LC_ALL=C.UTF-8 sort -uz)
+    if (( ${#fw_files[@]} )); then
+        msg 'Decompressing xz-compressed firmware files'
+        quiet "Decompressing '%s'" "${fw_files[@]#"$BUILDROOT"}"
+        xz -q -d -- "${fw_files[@]}"
+        mapfile -d '' -O "${#fw_file_symlinks[@]}" -t fw_file_symlinks \
+            < <(LC_ALL=C.UTF-8 find "${buildroot_fwpath[@]:?}" -type l -name '*.xz' -print0 2>/dev/null | LC_ALL=C.UTF-8 sort -uz)
+    fi
+
+    # Fix symlinks to point to the uncompressed files
+    if (( ${#fw_file_symlinks[@]} )); then
+        msg2 'Fixing firmware file symlinks'
+        for file in "${fw_file_symlinks[@]}"; do
+            linkobject="$(find "$file" -prune -printf '%l')"
+            symlink_message="Rewriting '${file#"${BUILDROOT}"} -> ${linkobject#"${BUILDROOT}"}' to"
+            # Remove the now invalid symlink
+            rm -- "${file:?}"
+
+            file="${file%.zst}" file="${file%.xz}"
+            linkobject="${linkobject%.zst}" linkobject="${linkobject%.xz}"
+            symlink_message="${symlink_message} '${file#"${BUILDROOT}"} -> ${linkobject#"${BUILDROOT}"}'"
+            quiet "$symlink_message"
+            # Create a new valid symlink
+            ln -sfTn -- "${linkobject:?}" "${file:?}"
+        done
+    fi
+}
+
 build_image() {
-    local out="$1" compressout="$1" compress="$2" errprog pipestatus
+    local out="$1" compressout="$1" compress="$2" errprog
+
+    if [[ "$MODULES_DECOMPRESS" == 'yes' ]] && (( ${#_d_fwpath[@]} )); then
+        decompress_firmware
+    fi
 
     case "$compress" in
         cat)
@@ -281,6 +332,26 @@ build_image() {
                 msg "Creating %s-compressed initcpio image" "$compress"
             else
                 msg "Creating %s-compressed initcpio image: '%s'" "$compress" "$out"
+            fi
+            # move all compressed files to the early cpio to avoid double compression
+            local compressed_files=()
+            mapfile -td '' compressed_files < <(find "$BUILDROOT" -type f \
+                -regextype posix-extended -regex '.*\.(bz2|gz|lz4|lzma|lzo|xz|zst)' -printf './%P\0')
+            if (( ${#compressed_files[@]} )) && pushd "$BUILDROOT" >/dev/null; then
+                quiet "Moving to early root: '%s'" "${compressed_files[@]#.}"
+                # try to hard link files, fall back to copy if that fails
+                cp -flt "$EARLYROOT" --parents "${compressed_files[@]}" 2>/dev/null \
+                    || cp -fat "$EARLYROOT" --parents "${compressed_files[@]}"
+                rm -f "${compressed_files[@]}"
+                # delete moved directories if they are empty, sorted by depth ascending
+                local moved_dirs=()
+                mapfile -td '' moved_dirs < <(printf '%s\0' "${compressed_files[@]%/*}" \
+                    | awk -vRS='\0' '{printf("%d\t%s\0", split($0, _, "/"), $0)}' \
+                    | LC_ALL=C.UTF-8 sort -uz -k1n,1 -k2 | cut -zf2-)
+                while (( ${#moved_dirs[@]} )); do
+                    mapfile -td '' moved_dirs < <(find "${moved_dirs[@]}" -maxdepth 0 -empty -delete -printf '%h\0' | uniq -z)
+                done
+                popd >/dev/null || return
             fi
             ;;&
         xz)
@@ -308,6 +379,8 @@ build_image() {
     # initialize an empty output file
     : >"$compressout"
 
+    # remove empty dirs and symlinks from EARLYROOT
+    find "$EARLYROOT" -depth '(' -type d -empty -delete ')' -or '(' -xtype l -delete ')'
     # if the EARLYROOT is not empty (except for the flag file), prepend it to the image
     if [[ -n "$(LC_ALL=C.UTF-8 find "$EARLYROOT" -mindepth 1 -not -name early_cpio)" ]]; then
         errprog="$(create_image "$EARLYROOT" "$compressout" early)"
@@ -340,52 +413,65 @@ build_image() {
     fi
 }
 
-# do not invoke directly, this is called by uki_init and uki_add_section
-_uki_increase_offset() {
-    local step="$1"
-    _uki_offset+="$(((step + _uki_alignment - 1) / _uki_alignment * _uki_alignment))"
+validate_compression() {
+    local major minor compression_fallback='zstd'
+
+    if [[ -z "$_optcompress" && -v COMPRESSION_OPTIONS && ! -v COMPRESSION ]]; then
+        warning 'COMPRESSION_OPTIONS is set without also setting COMPRESSION. Configure COMPRESSION explicitly!'
+    fi
+
+    # Linux < 5.9 does not support zstd-compressed initramfs. Fall back to gzip.
+    IFS=.- read -r major minor _ <<<"$KERNELVERSION"
+    if ! (( major > 5 || (major == 5 && minor >= 9) )); then
+        compression_fallback='gzip'
+        # Show a warning if zstd compression was explicitly configured.
+        if [[ "${_optcompress:-${COMPRESSION}}" == 'zstd' ]]; then
+            _optcompress=''
+            unset COMPRESSION COMPRESSION_OPTIONS
+            warning 'Kernel %s does not support zstd-compressed initramfs. Using gzip compression instead.' "$KERNELVERSION"
+        fi
+    fi
+    _optcompress="${_optcompress:-"${COMPRESSION:-${compression_fallback}}"}"
+
+    if ! type -P "$_optcompress" >/dev/null; then
+        warning "Unable to locate compression method: '%s'" "$_optcompress"
+        _optcompress='cat'
+    fi
 }
 
 uki_init() {
-    local uefistub="$1"
+    local uefistub="$1" ukiconfig="$2"
+    declare -ga _uki_build_args=()
+    command -v ukify &>/dev/null || _optnoukify=1
 
-    # global variables shared between uki functions
-    declare -gi _uki_offset=0 _uki_alignment=0
-    declare -ga _uki_objcopy_args=("$uefistub")
-
-    # reproducibility, preserve dates of used files
-    _uki_objcopy_args+=(-p)
-
-    _uki_alignment="$(LC_ALL=C.UTF-8 objdump -p "${uefistub}" \
-        | awk '/SectionAlignment/ {print strtonum("0x"$2)}')"
-    _uki_increase_offset "$(LC_ALL=C.UTF-8 objdump -h "${uefistub}" \
-        | awk 'NF==7 {size=strtonum("0x"$3); offset=strtonum("0x"$4)} END {print size + offset}')"
-}
-
-uki_add_section() {
-    local secname="$1" filename="${2:-/dev/stdin}"
-    if [[ ! -f "$filename" ]]; then
-        local tmpfile
-        tmpfile="$(mktemp -t 'mkinitcpio.XXXXXX')"
-        _tmpfiles+=("$tmpfile")
-        cat -- "$filename" > "$tmpfile"
-        filename="$tmpfile"
+    if (( ! _optnoukify )); then
+        msg2 'Using ukify to build UKI'
+        declare -gA _ukify_section_map=(
+            [.linux]='--linux='
+            [.initrd]='--initrd='
+            [.cmdline]='--cmdline=@'
+            [.osrel]='--os-release=@'
+            [.splash]='--splash='
+        )
+        if [[ -z "$ukiconfig" ]]; then
+            for ukiconfig in {/etc,/usr/lib}/kernel/uki.conf ''; do
+                if [[ -f "$ukiconfig" ]]; then
+                    quiet "Using ukify config: '%s'" "$ukiconfig"
+                    break
+                fi
+            done
+        fi
+        _uki_build_args+=(ukify build --uname="$KERNELVERSION")
+        [[ -z "$ukiconfig" ]] || _uki_build_args+=("--config=$ukiconfig")
+        [[ -z "$uefistub" ]] || warning '--uefistub given but using ukify'
+        return 0
     fi
-    _uki_objcopy_args+=(--add-section "$secname=$filename" --change-section-vma "$secname=$(printf 0x%x "$_uki_offset")")
-    _uki_increase_offset "$(stat -Lc%s "$filename")"
-}
 
-uki_assemble() {
-    local out="$1"
-    objcopy "${_uki_objcopy_args[@]}" "$out"
-}
-
-build_uki() {
-    local out="$1" initramfs="$2" cmdline="$3" osrelease="$4" splash="$5" kernelimg="$6" uefistub="$7" stub cpuarch uefiarch
-
-    msg "Creating unified kernel image: '%s'" "$out"
+    quiet 'Using objcopy to build UKI'
+    [[ -z "$ukiconfig" ]] || warning '--ukiconfig given but not using ukify'
 
     if [[ -z "$uefistub" ]]; then
+        local cpuarch stub uefiarch
         cpuarch="$(uname -m)"
         case "$cpuarch" in
             x86_64)
@@ -429,7 +515,60 @@ build_uki() {
         return 1
     fi
 
-    uki_init "$uefistub"
+    # global variables shared between uki functions
+    _uki_build_args+=(objcopy "$uefistub" -p)
+    declare -gi _uki_offset=0 _uki_alignment=0
+    _uki_increase_offset() {
+        local step="$1"
+        _uki_offset+="$(((step + _uki_alignment - 1) / _uki_alignment * _uki_alignment))"
+    }
+
+    _uki_alignment="$(LC_ALL=C.UTF-8 objdump -p "${uefistub}" \
+        | awk '/SectionAlignment/ {print strtonum("0x"$2)}')"
+    _uki_increase_offset "$(LC_ALL=C.UTF-8 objdump -h "${uefistub}" \
+        | awk 'NF==7 {size=strtonum("0x"$3); offset=strtonum("0x"$4)} END {print size + offset}')"
+
+    # always add the uname section
+    uki_add_section '.uname' <(printf '%s' "$KERNELVERSION")
+}
+
+uki_add_section() {
+    local secname="$1" filename="${2:-/dev/stdin}"
+    if [[ ! -f "$filename" ]]; then
+        local tmpfile
+        tmpfile="$(mktemp -t 'mkinitcpio.XXXXXX')"
+        _tmpfiles+=("$tmpfile")
+        cat -- "$filename" > "$tmpfile"
+        filename="$tmpfile"
+    fi
+    if (( ! _optnoukify )); then
+        _uki_build_args+=("${_ukify_section_map["$secname"]:-"--section=$secname:@"}$filename")
+    else
+        _uki_build_args+=(--add-section "$secname=$filename" --change-section-vma "$secname=$(printf '0x%x' "$_uki_offset")")
+        _uki_increase_offset "$(stat -Lc '%s' "$filename")"
+    fi
+}
+
+uki_assemble() {
+    local out="$1"
+    if (( ! _optnoukify )); then
+        _uki_build_args+=("--output=$out")
+    else
+        _uki_build_args+=("$out")
+    fi
+    quiet 'Assembling UKI: %s' "${_uki_build_args[*]}"
+    if (( _optquiet )); then
+        "${_uki_build_args[@]}" >/dev/null
+    else
+        "${_uki_build_args[@]}"
+    fi
+}
+
+build_uki() {
+    local out="$1" initramfs="$2" cmdline="$3" osrelease="$4" splash="$5" kernelimg="$6" uefistub="$7" ukiconfig="$8"
+
+    msg "Creating unified kernel image: '%s'" "$out"
+    uki_init "$uefistub" "$ukiconfig" || return 1
 
     if [[ -z "$osrelease" ]]; then
         if [[ -f "/etc/os-release" ]]; then
@@ -450,7 +589,6 @@ build_uki() {
         printf 'VERSION_ID=%s%s\n' "$KERNELVERSION" "${suffix:+"~$suffix"}"
         grep -v '^VERSION_ID=' "$osrelease"
     )
-    uki_add_section '.uname' <(printf %s "$KERNELVERSION")
 
     local cmdline_files=()
     if [[ -n "$cmdline" ]]; then
@@ -475,7 +613,7 @@ build_uki() {
         fi
 
         if (( ! ${#cmdline_files[@]} )); then
-            warning "Note: no cmdline files where found and --cmdline is not set!"
+            warning "Note: no cmdline files were found and --cmdline is not set!"
             cmdline_files=("/proc/cmdline")
             warning "Reusing current kernel cmdline from ${cmdline_files[*]}"
         else
@@ -517,13 +655,11 @@ build_uki() {
 
     uki_add_section '.initrd' "$initramfs"
 
-    uki_assemble "$out"
-
-    status="$?"
-    if (( status )) ; then
-        error 'Unified kernel image generation FAILED'
-    else
+    if uki_assemble "$out"; then
         msg 'Unified kernel image generation successful'
+    else
+        error 'Unified kernel image generation FAILED'
+        return 1
     fi
 }
 
@@ -703,6 +839,26 @@ run_post_hooks() {
     return 0
 }
 
+check_path() {
+    # mode can be any combination of drw (directory/readable/writable)
+    local mode="$1" opt="$2" path="$3" mesg
+    mesg="Invalid option $opt"
+    # realpath will reject file/file and dirs without the x flag
+    path="$(realpath -qs -- "$path")" || die "%s -- '%s' is an invalid path" "$mesg" "$3"
+    mesg+=" -- '$path'"
+    if [[ "$mode" == *d* ]]; then
+        [[ ! -d "$path" ]] && die '%s must be a directory' "$mesg"
+        [[ "$mode" == *w* && ! -w "$path" ]] && die '%s must be writable' "$mesg"
+    else
+        [[ -d "$path" ]] && die '%s must not be a directory' "$mesg"
+        # if the file doesn't exist, check if we can write to the parent directory
+        [[ "$mode" == *w* && ! ( -w "$path" || ! -e "$path" && -d "${path%/*}/." && -w "${path%/*}/." ) ]] \
+            && die '%s must be writable' "$mesg"
+    fi
+    [[ "$mode" == *r* && ! -r "$path" ]] && die '%s must be readable' "$mesg"
+    echo "$path"
+}
+
 # shellcheck source=functions
 . "$_f_functions"
 
@@ -710,9 +866,10 @@ trap 'cleanup' EXIT
 
 _opt_short='A:c:D:g:H:hk:nLMPp:Rr:S:sd:t:U:Vvz:'
 _opt_long=('add:' 'addhooks:' 'config:' 'generate:' 'hookdir': 'hookhelp:' 'help'
-           'kernel:' 'listhooks' 'automods' 'moduleroot:' 'nocolor' 'allpresets'
+           'kernel:' 'listhooks' 'automods' 'moduleroot:' 'nocolor' 'nopost' 'allpresets'
            'preset:' 'remove' 'skiphooks:' 'save' 'generatedir:' 'builddir:' 'version' 'verbose' 'compress:'
-           'uki:' 'uefi:' 'microcode:' 'splash:' 'kernelimage:' 'uefistub:' 'cmdline:' 'osrelease:' 'no-cmdline')
+           'uki:' 'uefi:' 'microcode:' 'splash:' 'kernelimage:' 'uefistub:' 'cmdline:' 'osrelease:' 'no-cmdline'
+           'ukiconfig:' 'no-ukify')
 
 parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
 set -- "${OPTRET[@]}"
@@ -728,34 +885,35 @@ while :; do
             unset add
             ;;
         -c | --config)
-            shift
-            _f_config="$1"
+            _f_config="$(check_path r "$1" "$2")" || exit
             _optconfd=0
+            shift
             ;;
         --cmdline)
+            _optcmdline="$(check_path r "$1" "$2")" || exit
             shift
-            _optcmdline="$1"
             ;;
         --no-cmdline)
             _optnocmdline=1
             ;;
         -k | --kernel)
+            if [[ "$KERNELVERSION" == /* ]]; then
+                KERNELVERSION="$(check_path r "$1" "$2")" || exit
+            else
+                KERNELVERSION="$2"
+            fi
             shift
-            KERNELVERSION="$1"
             ;;
         -s | --save)
             _optsavetree=1
             ;;
         -d | --generatedir)
+            _opttargetdir="$(check_path dw "$1" "$2")" || exit
             shift
-            _opttargetdir="$1"
             ;;
         -g | --generate)
+            _optgenimg="$(check_path w "$1" "$2")" || exit
             shift
-            [[ -d "$1" ]] && die 'Invalid image path -- must not be a directory'
-            if ! _optgenimg="$(readlink -f "$1")" || [[ ! -e "${_optgenimg%/*}" ]]; then
-                die "Unable to write to path: '%s'" "$1"
-            fi
             ;;
         -h | --help)
             usage
@@ -775,15 +933,15 @@ while :; do
         -n | --nocolor)
             _optcolor=0
             ;;
+        --nopost)
+            _optnopost=1
+            ;;
         --uefi)
             warning 'The --uefi option is deprecated. Use --uki instead.'
             ;&
         -U | --uki)
+            _optuki="$(check_path w "$1" "$2")" || exit
             shift
-            [[ -d "$1" ]] && die "Invalid image path -- must not be a directory"
-            if ! _optuki="$(readlink -f "$1")" || [[ ! -e "${_optuki%/*}" ]]; then
-                die "Unable to write to path: '%s'" "$1"
-            fi
             ;;
         -v | --verbose)
             _optquiet=0
@@ -804,17 +962,23 @@ while :; do
             exit 0
             ;;
         --splash)
+            _optsplash="$(check_path r "$1" "$2")" || exit
             shift
-            [[ -f "$1" ]] || die 'Invalid file -- must be a file'
-            _optsplash="$1"
             ;;
         --kernelimage)
+            _optkernelimage="$(check_path r "$1" "$2")" || exit
             shift
-            _optkernelimage="$1"
             ;;
         --uefistub)
+            _optuefistub="$(check_path r "$1" "$2")" || exit
             shift
-            _optuefistub="$1"
+            ;;
+        --ukiconfig)
+            _optukiconfig="$(check_path r "$1" "$2")" || exit
+            shift
+            ;;
+        --no-ukify)
+            _optnoukify=1
             ;;
         -M | --automods)
             _optshowautomods=1
@@ -827,27 +991,29 @@ while :; do
             [[ -e "${_optpreset[0]}" ]] || die 'No presets found in %s' "$_d_presets"
             ;;
         --osrelease)
+            _optosrelease="$(check_path r "$1" "$2")" || exit
             shift
-            [[ ! -f "$1" ]] && die 'Invalid file -- must be a file'
-            _optosrelease="$1"
             ;;
         -t | --builddir)
+            TMPDIR="$(check_path dw "$1" "$2")" || exit
+            export TMPDIR
             shift
-            export TMPDIR="$1"
             ;;
         -z | --compress)
             shift
             _optcompress="$1"
             ;;
         -r | --moduleroot)
+            _optmoduleroot="$(check_path dr "$1" "$2")" || exit
             shift
-            _optmoduleroot="$1"
             ;;
         -D | --hookdir)
+            tmp="$(check_path dr "$1" "$2")" || exit
             shift
-            _d_flag_hooks+="$1/hooks:"
-            _d_flag_install+="$1/install:"
-            _d_flag_post+="$1/post:"
+            _d_flag_hooks+="$tmp/hooks:"
+            _d_flag_install+="$tmp/install:"
+            _d_flag_post+="$tmp/post:"
+            unset tmp
             ;;
         --)
             shift
@@ -909,13 +1075,14 @@ if [[ "$KERNELVERSION" != 'none' ]]; then
 
     if [[ -z "$KERNELIMAGE" ]]; then
         # search well-known locations for the kernel image
-        for img in "$_d_kmoduledir/vmlinuz" "/lib/modules/$KERNELVERSION/vmlinuz"; do
+        for img in "$_d_kmoduledir/vmlinuz" "/lib/modules/$KERNELVERSION/vmlinuz" \
+            "$_d_kmoduledir/vmlinux" "/lib/modules/$KERNELVERSION/vmlinux"; do
             if [[ -f "$img" ]]; then
                 KERNELIMAGE="$img"
                 if read -r pkgbase &>/dev/null <"${img%/*}/pkgbase"; then
-                    KERNELDESTINATION="/boot/vmlinuz-$pkgbase"
+                    KERNELDESTINATION="/boot/${img##*/}-${pkgbase}"
                 else
-                    KERNELDESTINATION="/boot/vmlinuz-$KERNELVERSION"
+                    KERNELDESTINATION="/boot/${img##*/}-${KERNELVERSION}"
                 fi
                 quiet "located kernel image: '%s'" "$KERNELIMAGE"
                 break
@@ -925,8 +1092,8 @@ if [[ "$KERNELVERSION" != 'none' ]]; then
 
     if [[ -z "$KERNELIMAGE" ]]; then
         # check version of all kernels in /boot
-        for img in /boot/vmlinuz-*; do
-            if [[ "$(kver "$img")" == "$KERNELVERSION" ]]; then
+        for img in /boot/vmlinuz-* /boot/vmlinux-*; do
+            if [[ -f "$img" && "$(kver "$img")" == "$KERNELVERSION" ]]; then
                 KERNELIMAGE="$img"
                 quiet "located kernel image: '%s'" "$KERNELIMAGE"
                 break
@@ -943,10 +1110,10 @@ if [[ "$KERNELVERSION" != 'none' ]]; then
     fi
 fi
 
-MODULES_DECOMPRESS="${MODULES_DECOMPRESS:-"yes"}"
+MODULES_DECOMPRESS="${MODULES_DECOMPRESS:-"no"}"
 
 _d_workdir="$(initialize_buildroot "$KERNELVERSION" "$_opttargetdir")" || exit 1
-BUILDROOT="$_d_workdir/root"
+BUILDROOT="${_opttargetdir:-$_d_workdir/root}"
 EARLYROOT="$_d_workdir/early"
 
 # Source additional configuration files, if no configuration file has been defined either with "-c" or via preset file
@@ -991,25 +1158,16 @@ if (( _optshowautomods )); then
 fi
 
 if [[ -n "$_optgenimg" ]]; then
-    # check for permissions. if the image doesn't already exist,
-    # then check the directory
-    if [[ ( -e $_optgenimg && ! -w $_optgenimg ) ||
-            ( ! -d ${_optgenimg%/*} || ! -w ${_optgenimg%/*} ) ]]; then
-        die "Unable to write to '%s'" "$_optgenimg"
-    fi
-
-    _optcompress="${_optcompress:-"${COMPRESSION:-zstd}"}"
-    if ! type -P "$_optcompress" >/dev/null; then
-        warning "Unable to locate compression method: '%s'" "$_optcompress"
-        _optcompress='cat'
-    fi
-
+    validate_compression
     msg "Starting build: '%s'" "$KERNELVERSION"
 elif [[ -n "$_opttargetdir" ]]; then
     msg "Starting build: '%s'" "$KERNELVERSION"
 else
     msg "Starting dry run: '%s'" "$KERNELVERSION"
 fi
+
+# Set umask to so hooks install files with 644 permissions by default
+umask 022
 
 # set functrace and trap to catch errors in add_* functions
 declare -i _builderrors=0
@@ -1053,11 +1211,15 @@ else
 fi
 
 if [[ -n "$_optuki" && -n "$_optgenimg" ]]; then
-    build_uki "$_optuki" "$_optgenimg" "$_optcmdline" "$_optosrelease" "$_optsplash" "$_optkernelimage" "$_optuefistub" \
-        && (( ${#_generated[*]} )) && _generated+=("$_optuki")
+    if build_uki "$_optuki" "$_optgenimg" "$_optcmdline" "$_optosrelease" \
+            "$_optsplash" "$_optkernelimage" "$_optuefistub" "$_optukiconfig"; then
+        (( ${#_generated[@]} )) && _generated+=("$_optuki")
+    else
+        (( ++_builderrors ))
+    fi
 fi
 
-if (( ${#_generated[*]} )); then
+if (( ${#_generated[@]} && ! _optnopost )); then
     run_post_hooks "${_generated[@]}" || (( ++_builderrors ))
 fi
 

@@ -3,11 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 _detect_kver() {
-    local __ kver_validator='^[[:digit:]]+(\.[[:digit:]]+)+' offset
-    offset="$(od -An -j0x20E -dN2 "$1")" || return
-    read kver __ < \
-        <(dd if="$1" bs=1 count=127 skip=$(( offset + 0x200 )) 2>/dev/null)
-    [[ "$kver" =~ $kver_validator ]] && printf "$kver"
+    ./functions run_mkinitcpio_func kver "$1"
 }
 
 _find_kernel_versions() {
@@ -37,6 +33,8 @@ case $service in
             '(-n --nocolor)'{-n,--nocolor}'[disable colorized output]' \
             '(-V --version)'{-V,--version}'[display version information]' \
             '(-v --verbose)'{-v,--verbose}'[more verbose output]' \
+            '--cpio[list or extract only the main CPIO image]' \
+            '--early[list or extract only the early CPIO image]' \
             ':image file:_files'
         ;;
     mkinitcpio)
@@ -52,6 +50,7 @@ case $service in
             '(-L --listhooks)'{-L,--listhooks}'[List all available hooks]' \
             '(-M --automods)'{-M,--automods}'[Display modules found via autodetection]' \
             '(-n --nocolor)'{-n,--nocolor}'[Disable colorized output messages]' \
+            '--nopost[Disable post hooks]' \
             '(-P --allpresets)'{-P,--allpresets}'[Process all presets in /etc/mkinitcpio.d]' \
             '(-p --preset)'{-p,--preset}'[Build specified preset from /etc/mkinitcpio.d]:presets:_files -g "*(\:r)" -W /etc/mkinitcpio.d' \
             '--remove[Remove specified preset images]' \
@@ -64,10 +63,13 @@ case $service in
             '(-z --compress)'{-z,--compress}'[Use an alternate compressor on the image]' \
             '(-U --uki)'{-U,--uki}'[Build a unified kernel image]:path:_files' \
             '--cmdline[Specify kernel cmdline for the unified kernel image]:path:_files' \
+            '--no-cmdline[Do not embed a cmdline in the unified kernel image]' \
             '--kernelimage[Include a kernel image for the unified kernel image]:path:_files' \
             '--osrelease[Include a os-release file for the unified kernel image]:path:_files' \
             '--splash[Bitmap splash image to include in unified kernel image]:path:_files' \
             '--uefistub[UEFI stub image used for unified kernel image generation]:path:_files' \
+            '--ukiconfig[Config file for ukify for unified kernel image generation]:path:_files' \
+            '--no-ukify[Do not use ukify for unified kernel image generation]:path:_files' \
         ;;
     *)
         return 1;
