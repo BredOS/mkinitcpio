@@ -1,5 +1,5 @@
 pkgname=mkinitcpio
-pkgver=38.bredos
+pkgver=39.1.bredos
 pkgrel=1
 pkgdesc="Modular initramfs image creation utility"
 arch=(any)
